@@ -57,49 +57,138 @@ Julia and how I gained a 100x speedup in the process.
 ## Root finding in Python
 
 Python has excellent routines for solving these kinds of optimization problems
-in [scipy.optimize](https://docs.scipy.org/doc/scipy/reference/optimize.html#root-finding)
-and the code below solves root finding problem for a single set of $\theta_l$,
-$p$ and $q_l$:
+in [scipy.optimize](https://docs.scipy.org/doc/scipy/reference/optimize.html#root-finding) which
+I use to solve the root finding problem below. *NOTE*: Because I want to benchmark the Python and
+Julia implementations together I will be using the excellent [PyCall.jl]() package below
+which lets me execute python code in this same Julia notebook (using [Weave.jl]() - you should
+check it out if you want to create reports/blogs in Julia!). These leads to a slight
+overhead as I'm calling Python from Julia, but you'll have to beleave me, that's
+not where the majority of the speed differences come from.
 
+We'll start by importing `PyCall` within Julia and then executing some Python 
+instructions to import the `numpy` and `scipy` packages that we'll be using:
 
-```python
-#using PyCall
-
-#py"""
+```julia
+using PyCall
+py"""
 import numpy as np
 import scipy.optimize
-42
+"""
+```
 
-def calc_temperature(q_l, p, theta_l, T_atol=0.01):
-    # constants from UCLALES
-    cp_d = 1.004 * 1.0e3  # [J/kg/K]
-    R_d = 287.04  # [J/kg/K]
-    L_v = 2.5 * 1.0e6  # [J/kg]
-    p_theta = 1.0e5  # [Pa]
+We'll the define the function to compute $\theta_l$
+
+```julia
+py"""
+# constants from UCLALES
+cp_d = 1.004 * 1.0e3  # [J/kg/K]
+R_d = 287.04  # [J/kg/K]
+L_v = 2.5 * 1.0e6  # [J/kg]
+p_theta = 1.0e5  # [Pa]
+
+def calc_theta_l(T, p, q_l):
+    return T * (p_theta / p) ** (R_d / cp_d) * np.exp(
+        -L_v * q_l / (cp_d * T)
+    )
+"""
+```
+
+And check that this works for a single pair of $\theta_l$, $p$ and $q_l$ values:
+
+```julia
+py"""calc_theta_l"""(300.,1.0e5, 0.1e-3)
+```
+
+Next we define a function which uses scipy's root-finding routine to calculate
+the absolute temperature for a single set of $\theta_l$, $p$ and $q_l$ values:
+
+
+```julia
+py"""
+def calc_temperature(theta_l, p, q_l, T_atol=0.01):
 
     # XXX: this is *not* the *actual* liquid potential temperature (as
     # given in B. Steven's notes on moist thermodynamics), but instead
     # reflects the form used in UCLALES where in place of the mixture
     # heat-capacity the dry-air heat capacity is used
-    def temp_func(T):
-        return theta_l - T * (p_theta / p) ** (R_d / cp_d) * np.exp(
-            -L_v * q_l / (cp_d * T)
-        )
+
+    def root_func(T):
+        return theta_l - calc_theta_l(T, p, q_l)
+
+    # let initial guess be for case without liquid, in which case we can solve
+    # for temperature (T)
+    T_guess = theta_l / ((p_theta / p) ** (R_d / cp_d))
 
     if q_l == 0.0:
         # no need for root finding
-        return theta_l / ((p_theta / p) ** (R_d / cp_d))
+        return T_guess
 
     # XXX: brentq solver requires bounds, I don't expect we'll get below -100C
     T_min = -100.0 + 273.0
     T_max = 50.0 + 273.0
-    T = scipy.optimize.brentq(f=temp_func, a=T_min, b=T_max)
+    T = scipy.optimize.brentq(f=root_func, a=T_min, b=T_max)
 
     return T
 
-calc_temperature(1.0e-3, 1.0e5, 301.0)
+T_true, p, q_l = 300.0, 1.0e5, 0.1e-3
+theta_l = calc_theta_l(T_true, p, q_l)
+print(T_true - calc_temperature(theta_l, p, q_l))
+"""
 ```
 
+Now, how to do we next apply this across a whole of array of $\theta_l$, $p$ and
+$q_l$ pairs? The first thing I tried was using
+[numpy.vectorize](https://numpy.org/doc/stable/reference/generated/numpy.vectorize.html).
+But unfortunately the execution is serial, and so rather slow. Let's create a
+arrays of values and benchmark this first solution to the problem. I'll be using
+`@btime` in julia from `BenchmarkTools.jl` to do the benchmarking and so it's easier to just
+create the test values in julia as well (you could of course do this in python
+to, I did initially):
+
+
+```julia
+function create_test_data(N)
+    # make up some fake temperature, p, and q_l values
+    q_l = 0.5e-3 .+ (rand(N) .* 1e-3)
+    p = 1.0e5 .+ (rand(N) .* 1e2)
+    T = 300.0 .+ 10.0 .* rand(N)
+    return (T, p, q_l)
+end
+```
+
+First we'll benchmark doing the vectorizsation with `numpy.vectorize`:
+
+```julia
+using BenchmarkTools
+
+N_samples = 1_000_000
+T_true, p, q_l = create_test_data(N_samples)
+theta_l = py"""calc_theta_l"""(T_true, p, q_l)
+@btime theta_l = py"""np.vectorize(calc_temperature)"""(T_true, p, q_l);
+```
+
+
+and check that this works for a single pair of values
+
+```julia
+py"""
+
+T_true, p, q_l = 300.0, 1.0e5, 0.1e-3
+theta_l = calc_theta_l(T_true, p, q_l)
+T_true - calc_temperature(theta_l, p, q_l)
+"""
+```
+
+
+```julia
+function create_test_data(N)
+    # make up some fake temperature, p, and q_l values
+    q_l = 0.5e-3 .+ (rand(N) .* 1e-3)
+    p = 1.0e5 .+ (rand(N) .* 1e2)
+    T = 300.0 .+ 10.0 .* rand(N)
+    return (T, p, q_l)
+end
+```
 
 
 ## Root finding in Julia
@@ -135,7 +224,7 @@ function create_test_data(N)
     return (T, p, q_l)
 end
 
-N_samples = 1000000
+N_samples = 1_000
 T_true, p, q_l = create_test_data(N_samples)
 theta_l = calc_theta_l.(T_true, p, q_l)
 ```
@@ -189,6 +278,8 @@ T_est = similar(theta_l)
 
 
 
+
+
 Need to mention "NUM_THREADS" here
 
 That only took 
@@ -198,3 +289,52 @@ And there is the
     theta_l = @strided calc_theta_l.(T_true, p, q_l)
     T_est = @strided calc_T.(theta_l, p, q_l)
     T_est - T_true
+
+
+```julia
+function calc_T2!(theta_l, p, q_l, T_out; T_atol=1.0e-3)
+    function root_func(T)
+        theta_l - calc_theta_l(T, p, q_l)
+    end
+
+    # start with a guess with assuming no liquid water, in which case we can
+    # solve for T
+    T_out = theta_l / (p_theta / p) ^ (R_d / cp_d)
+
+    if q_l == 0
+        return T_guess
+    end
+
+    find_zero(root_func, T_out, rtol=1.0e-6, atol=T_atol)
+end
+
+T_out = similar(theta_l)
+@btime calc_T2!.(theta_l, p, q_l, T_out);
+```
+
+
+```julia
+using ForwardDiff
+D(f) = x -> ForwardDiff.derivative(f,float(x))
+
+function calc_T3(theta_l, p, q_l; T_atol=1.0e-3)
+    function f(T)
+        theta_l - T * (p_theta / p) ^ (R_d / cp_d) * exp(-L_v * q_l / (cp_d * T))
+    end
+
+    #find_zero(f, (50, 400), Bisection())
+    find_zero(f, theta_l)
+end
+
+@btime calc_T3(theta_l[1], p[1], q_l[1]);
+```
+
+
+```julia
+function lol(a)
+    f(x) = exp(x) - x^4 + a
+    find_zero(f, (8,9), Bisection())
+end
+
+@btime lol(1.0)
+```
